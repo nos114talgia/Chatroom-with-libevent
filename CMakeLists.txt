@@ -15,6 +15,6 @@ add_executable(server server.cpp)
 add_executable(client client.cpp)
 
 target_include_directories(server PRIVATE ${LIBEVENT_INCLUDE_DIRS})
-target_link_libraries(server PRIVATE ${LIBEVENT_LIBRARIES})
+target_link_libraries(server PRIVATE ${LIBEVENT_LIBRARIES} Threads::Threads)
 target_link_libraries(client PRIVATE Threads::Threads)
 
