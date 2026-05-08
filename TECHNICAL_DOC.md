@@ -2,16 +2,25 @@
 
 ## 1. 项目概述
 
-这是一个基于 **libevent** 的聊天室项目，包含两个服务器版本：
+这是一个基于 **libevent** 的聊天室项目，包含两个服务器版本和两个客户端版本：
+
+**服务器：**
 
 | 版本 | 源文件 | 线程模型 | 说明 |
 |------|--------|----------|------|
 | 单线程版 | `server.cpp` | 单线程事件循环 | 所有 I/O 和业务逻辑在主线程完成 |
 | 线程池版 | `server_withThreadPool.cpp` | 主线程 I/O + 线程池业务处理 | I/O 与业务逻辑分离 |
 
+**客户端：**
+
+| 版本 | 源文件 | 线程模型 | 说明 |
+|------|--------|----------|------|
+| 多线程版 | `client.cpp` | 双线程（发送+接收） | 原始 POSIX 套接字，独立接收线程 |
+| libevent 版 | `client_libevent.cpp` | 单线程事件循环 | 基于 libevent，stdin 和网络统一事件驱动 |
+
 ### 关键特性
 - 基于 libevent 的高效事件驱动网络 I/O
-- 4 线程的消息处理线程池（线程池版）
+- 4 线程的消息处理线程池（线程池版服务器）
 - 支持用户注册、在线列表、私聊、广播等完整聊天功能
 - 自定义文本行协议（`\n` 分隔）
 - 通过 mutex 和 libevent 线程安全机制保证数据一致性（线程池版）
@@ -418,11 +427,12 @@ void event_cb(struct bufferevent* bev, short events, void* context){
 
 ```
 Chatroom-with-libevent/
-├── server.cpp                  # 单线程版服务器（原版，未修改）
+├── server.cpp                  # 单线程版服务器（原版）
 ├── server_withThreadPool.cpp   # 线程池版服务器（基于原版改造）
-├── client.cpp                  # 客户端
+├── client.cpp                  # 多线程客户端（原始 POSIX 套接字）
+├── client_libevent.cpp         # libevent 客户端（单线程事件驱动）
 ├── Thread_pool.hpp             # 线程池实现（header-only）
-├── CMakeLists.txt              # 构建配置（同时构建两个服务器）
+├── CMakeLists.txt              # 构建配置
 └── TECHNICAL_DOC.md            # 本文档
 ```
 
@@ -477,6 +487,103 @@ target_link_libraries(server_withThreadPool PRIVATE ${LIBEVENT_LIBRARIES} Thread
 
 ---
 
+### 5.5 `client_libevent.cpp` 技术说明
+
+#### 5.5.1 设计目标
+
+与 `client.cpp`（多线程版）功能相同，但采用**纯事件驱动**架构，无需额外线程：
+
+| 对比项 | `client.cpp`（多线程版） | `client_libevent.cpp`（libevent 版） |
+|--------|-------------------------|--------------------------------------|
+| 线程数 | 2（主线程 + 接收线程） | 1（单线程事件循环） |
+| 网络 I/O | `recv()` 阻塞调用 | `bufferevent` 异步回调 |
+| stdin 读取 | `std::getline` 阻塞 | libevent 监听 `STDIN_FILENO` 事件 |
+| 退出机制 | `shutdown()` + `join()` + `close(STDIN_FILENO)` | `event_base_loopexit()` 终止事件循环 |
+| 依赖 | POSIX sockets + pthreads | libevent |
+
+#### 5.5.2 架构
+
+```
+┌────────────────────────────────────────────────────────────┐
+│                   单线程事件循环（event_base）               │
+│                                                            │
+│  ┌──────────────────┐  ┌──────────────────┐               │
+│  │ 网络 bufferevent  │  │ stdin event      │               │
+│  │                  │  │ (EV_PERSIST)     │               │
+│  │ • read_cb        │  │ • stdin_cb       │               │
+│  │   收到服务器消息  │  │   读取用户输入    │               │
+│  │   打印到控制台    │  │   发送给服务器    │               │
+│  │                  │  │                  │               │
+│  │ • event_cb       │  └──────────────────┘               │
+│  │   连接成功→注册   │                                    │
+│  │   断开/错误→退出  │                                    │
+│  └──────────────────┘                                    │
+└────────────────────────────────────────────────────────────┘
+```
+
+#### 5.5.3 核心组件
+
+**`clientCtx` — 客户端上下文**
+
+```cpp
+struct clientCtx {
+    struct event_base* base;       // 事件循环
+    struct bufferevent* bev;       // 网络连接（bufferevent 封装了 socket 读写）
+    struct event* stdin_event;     // 标准输入事件
+    bool registered;               // 是否已完成注册
+};
+```
+
+**`read_cb` — 网络数据回调**
+
+从 `bufferevent` 的输入缓冲区按 `\n` 分割消息行，打印到控制台。使用 `evbuffer_readln()` 自动处理 TCP 粘包。
+
+**`event_cb` — 连接事件回调**
+
+- `BEV_EVENT_CONNECTED`：连接成功后提示用户输入用户名，发送 `Hello <name>` 注册
+- `BEV_EVENT_ERROR` / `BEV_EVENT_EOF`：连接断开或出错时，设置退出标志并终止事件循环
+
+**`stdin_cb` — 标准输入回调**
+
+libevent 将 `STDIN_FILENO` 注册为事件源（`EV_READ | EV_PERSIST`）。当用户在终端输入并按回车时，触发此回调，读取一行文本并通过 `bufferevent` 发送给服务器。
+
+**`signal_handler` — 信号处理**
+
+收到 `SIGINT`（Ctrl+C）时调用 `event_base_loopexit()`，优雅终止事件循环。
+
+#### 5.5.4 关键实现细节
+
+```cpp
+// stdin 作为 libevent 事件源
+// STDIN_FILENO 是标准的文件描述符 0，libevent 可以监听它的可读事件
+g_ctx.stdin_event = event_new(g_ctx.base, STDIN_FILENO,
+                              EV_READ | EV_PERSIST, stdin_cb, nullptr);
+
+// 异步 TCP 连接
+bufferevent_socket_connect(g_ctx.bev, (struct sockaddr*)&sin, sizeof(sin));
+
+// 统一事件循环：网络和 stdin 在同一个 event_base 中处理
+event_base_dispatch(g_ctx.base);
+```
+
+#### 5.5.5 退出流程
+
+```
+用户按下 Ctrl+C
+       ↓
+signal_handler() 设置 g_running = false
+       ↓
+调用 event_base_loopexit() 通知事件循环退出
+       ↓
+event_base_dispatch() 返回
+       ↓
+释放 stdin_event → 释放 bev → 释放 base
+       ↓
+程序退出
+```
+
+---
+
 ## 6. 运行与编译
 
 ```bash
@@ -491,19 +598,29 @@ make
 # 运行线程池版服务器
 ./server_withThreadPool
 
-# 运行客户端
+# 运行多线程客户端
 ./client
+
+# 运行 libevent 客户端
+./client_libevent
 ```
 
 **输出示例**：
 ```
-# 单线程版
+# 单线程版服务器
 [System] Server started
 [System] New connection
 
-# 线程池版
+# 线程池版服务器
 [System] Server started (thread pool: 4 workers)
 [System] New connection
+
+# libevent 客户端
+[System] Connecting to server...
+[System] Connected to server
+Enter username: Alice
+[System] you have logged in as Alice
+Users: Alice
 ```
 
 ---

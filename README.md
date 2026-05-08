@@ -114,9 +114,21 @@ Enter message: PVT Alice Hey Alice, this is private!
 
 ## Project Structure
 
-*   `server.cpp`: Libevent-based event loop, user management, and command parsing.
-*   `client.cpp`: Multi-threaded socket client with signal handling.
+*   `server.cpp`: Single-threaded Libevent-based event loop, user management, and command parsing.
+*   `server_withThreadPool.cpp`: Thread-pool enhanced server — main thread handles I/O, 4-worker thread pool processes business logic.
+*   `client.cpp`: Multi-threaded socket client with signal handling (raw POSIX sockets).
+*   `client_libevent.cpp`: Libevent-based client — single-threaded event-driven I/O, same features as `client.cpp` but using `bufferevent` for network and stdin events.
+*   `Thread_pool.hpp`: Header-only C++ thread pool implementation.
 *   `CMakeLists.txt`: Build configuration for linking Libevent and Threads.
+
+### Build Targets
+
+| Target | Description |
+| :--- | :--- |
+| `server` | Single-threaded chat server |
+| `server_withThreadPool` | Multi-threaded chat server (thread pool) |
+| `client` | Multi-threaded client (raw sockets) |
+| `client_libevent` | Single-threaded client (libevent-based) |
 
 
 ---
@@ -236,9 +248,21 @@ Enter message: PVT Alice Hey Alice, this is private!
 
 ## 项目结构
 
-*   `server.cpp`：基于 Libevent 的事件循环、用户管理及指令解析逻辑。
-*   `client.cpp`：支持信号处理的多线程 Socket 客户端。
+*   `server.cpp`：单线程版 Libevent 事件循环、用户管理及指令解析逻辑。
+*   `server_withThreadPool.cpp`：线程池版服务器——主线程处理 I/O，4 工作线程处理业务逻辑。
+*   `client.cpp`：支持信号处理的多线程 Socket 客户端（原始 POSIX 套接字）。
+*   `client_libevent.cpp`：基于 Libevent 的客户端——单线程事件驱动 I/O，使用 `bufferevent` 处理网络和标准输入事件。
+*   `Thread_pool.hpp`：Header-only 的 C++ 线程池实现。
 *   `CMakeLists.txt`：用于链接 Libevent 和线程库的构建配置。
+
+### 构建目标
+
+| 目标 | 说明 |
+| :--- | :--- |
+| `server` | 单线程聊天服务器 |
+| `server_withThreadPool` | 多线程聊天服务器（线程池） |
+| `client` | 多线程客户端（原始套接字） |
+| `client_libevent` | 单线程客户端（libevent） |
 
 ---
 ## License

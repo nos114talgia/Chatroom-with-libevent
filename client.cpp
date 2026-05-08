@@ -9,22 +9,37 @@
 #include <atomic>
 #include <csignal>
 #include <algorithm>
+#include <fcntl.h>
 
 // global mark
 std::atomic<bool> is_running(true);
 std::atomic<bool> signal_received(false);
+int g_client_socket = -1;
 
-void signal_handler(int signal){
-    if(signal == SIGINT){
-        std::cout << "\n[System] Exiting..." << std::endl;
+void signal_handler(int sig){
+    if(sig == SIGINT){
         is_running = false;
         signal_received = true;
+        // Force shutdown the socket to unblock recv()
+        if(g_client_socket >= 0){
+            shutdown(g_client_socket, SHUT_RDWR);
+        }
+        // Close stdin fd to unblock std::getline()
+        // This causes the underlying read() to return with error,
+        // making getline return with fail bit set.
+        close(STDIN_FILENO);
     }
 }
 
 void receive_message(int client_socket) {
     std::string recv_buffer;
     char temp_buf[1024];
+
+    // Set a receive timeout so recv() doesn't block forever
+    struct timeval tv;
+    tv.tv_sec = 1;
+    tv.tv_usec = 0;
+    setsockopt(client_socket, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 
     while (is_running) {
         ssize_t len = recv(client_socket, temp_buf, sizeof(temp_buf), 0);
@@ -37,12 +52,25 @@ void receive_message(int client_socket) {
                 std::cout << message << std::endl; 
                 recv_buffer.erase(0, pos + 1);
             }
-        } else {
+        } else if (len == 0) {
+            // Server closed connection
             if (is_running) {
                 std::cout << "\n[System] Connection lost." << std::endl;
                 is_running = false;
             }
             break;
+        } else {
+            // len < 0: error
+            if (!is_running) break;  // Shutdown was called (signal or exit)
+            // EAGAIN/EWOULDBLOCK means timeout — just loop and re-check is_running
+            // Other errors: break
+            if (errno != EAGAIN && errno != EWOULDBLOCK) {
+                if (is_running) {
+                    std::cout << "\n[System] Connection error." << std::endl;
+                    is_running = false;
+                }
+                break;
+            }
         }
     }
 }
@@ -88,10 +116,16 @@ int main() {
         return -1;
     }
 
+    // Save socket fd globally for signal handler
+    g_client_socket = client_socket;
+
     // register and start receiving thread
     std::string username;
     std::cout << "Enter username: ";
-    std::getline(std::cin, username);
+    if (!std::getline(std::cin, username)) {
+        close(client_socket);
+        return 0;
+    }
     std::string reg_msg = "Hello " + username + "\n";
 
     std::thread t_recv(receive_message, client_socket);
@@ -101,14 +135,17 @@ int main() {
     // start sending
     send_message(client_socket);
 
+    // Ensure clean shutdown
     is_running = false;
+    g_client_socket = -1;
     shutdown(client_socket, SHUT_RDWR);
-    
+
     if (t_recv.joinable()) {
         t_recv.join();
     }
 
     close(client_socket);
+    std::cout << "[System] Exited." << std::endl;
 
     return 0;
 }
