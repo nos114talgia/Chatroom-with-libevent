@@ -12,9 +12,12 @@ pkg_check_modules(LIBEVENT REQUIRED
     libevent_pthreads)
 
 add_executable(server server.cpp)
+add_executable(server_withThreadPool server_withThreadPool.cpp)
 add_executable(client client.cpp)
 
 target_include_directories(server PRIVATE ${LIBEVENT_INCLUDE_DIRS})
-target_link_libraries(server PRIVATE ${LIBEVENT_LIBRARIES} Threads::Threads)
+target_include_directories(server_withThreadPool PRIVATE ${LIBEVENT_INCLUDE_DIRS})
+target_link_libraries(server PRIVATE ${LIBEVENT_LIBRARIES})
+target_link_libraries(server_withThreadPool PRIVATE ${LIBEVENT_LIBRARIES} Threads::Threads)
 target_link_libraries(client PRIVATE Threads::Threads)
 

@@ -2,13 +2,19 @@
 
 ## 1. 项目概述
 
-这是一个基于 **libevent** 的聊天室服务器，最初采用单线程事件循环模型。为提升并发处理能力，本项目集成了一个轻量级 C++ 线程池（`Thread_pool.hpp`），实现了 **I/O 与业务逻辑分离** 的架构。
+这是一个基于 **libevent** 的聊天室项目，包含两个服务器版本：
+
+| 版本 | 源文件 | 线程模型 | 说明 |
+|------|--------|----------|------|
+| 单线程版 | `server.cpp` | 单线程事件循环 | 所有 I/O 和业务逻辑在主线程完成 |
+| 线程池版 | `server_withThreadPool.cpp` | 主线程 I/O + 线程池业务处理 | I/O 与业务逻辑分离 |
 
 ### 关键特性
 - 基于 libevent 的高效事件驱动网络 I/O
-- 4 线程的消息处理线程池
+- 4 线程的消息处理线程池（线程池版）
 - 支持用户注册、在线列表、私聊、广播等完整聊天功能
-- 通过 mutex 和 libevent 线程安全机制保证数据一致性
+- 自定义文本行协议（`\n` 分隔）
+- 通过 mutex 和 libevent 线程安全机制保证数据一致性（线程池版）
 
 ---
 
@@ -61,6 +67,159 @@
 | **Sync Layer** | 业务逻辑处理（消息路由、广播、注册） | 线程池工作线程 |
 
 这种模式结合了事件驱动的高并发 I/O 和多线程的高效业务处理。
+
+### 2.3 自定义消息协议
+
+本项目采用**基于文本行的自定义协议**，所有消息以 `\n`（换行符）作为分隔符，使用 ASCII 文本编码。
+
+#### 2.3.1 传输层
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│  传输格式：ASCII 文本 + LF (\n) 行分隔                        │
+│                                                              │
+│  物理帧示例（TCP 字节流）：                                    │
+│  [48 65 6C 6C 6F 20 41 6C 69 63 65 0A]                      │
+│  [48 65 6C 6C 6F 20 42 6F 62 0A]                             │
+│   ├─ "Hello Alice\n" ─┘ ├─ "Hello Bob\n" ─┘                  │
+│                                                              │
+│  提取方式：evbuffer_readln(input, &len, EVBUFFER_EOL_LF)     │
+│  libevent 自动从 TCP 字节流中按 '\n' 切割出完整消息行          │
+└──────────────────────────────────────────────────────────────┘
+```
+
+#### 2.3.2 协议消息类型
+
+| # | 消息类型 | 方向 | 格式 | 示例 |
+|---|---------|------|------|------|
+| 1 | **用户注册** | C→S | `Hello <name>` | `Hello Alice` |
+| 2 | **在线列表请求** | C→S | `LIST` | `LIST` |
+| 3 | **私聊消息** | C→S | `PVT <target> <content>` | `PVT Bob 你好！` |
+| 4 | **广播消息** | C→S | `<任意文本>` | `大家好` |
+
+#### 2.3.3 服务器响应消息
+
+| # | 响应类型 | 方向 | 前缀 | 格式 | 示例 |
+|---|---------|------|------|------|------|
+| 1 | **系统通知** | S→C | `[System]` | `[System] <通知内容>` | `[System] you have logged in as Alice` |
+| 2 | **在线列表** | S→C | `Users:` | `Users: <name1> <name2> ...` | `Users: Alice Bob Charlie` |
+| 3 | **私聊消息** | S→C | `[PVT]` | `[PVT] <sender>: <content>` | `[PVT] Bob: 你好！` |
+| 4 | **广播消息** | S→C | 无前缀 | `<sender>: <content>` | `Alice: 大家好` |
+
+#### 2.3.4 协议详细说明
+
+**① 用户注册协议 `Hello <name>`**
+
+```
+客户端 → 服务器:  Hello Alice\n
+
+服务器处理逻辑：
+  1. 检查该连接是否已注册
+  2. 如果未注册且用户名已存在，自动追加后缀：Alice → Alice_2 → Alice_3 ...
+  3. 在 name_to_buffer / buffer_to_name 中建立映射
+
+服务器 → 当前用户:  [System] you have logged in as Alice\n
+                    Users: Alice Bob Charlie\n
+服务器 → 其他用户:  [System] Alice has logged in\n
+```
+
+- 用户名允许的字符：任意非空字符串
+- 长度限制：`Hello ` 前缀占 6 字节，用户名最少 1 字节，因此有效消息最小长度为 7 字节
+- 重名处理：自动追加 `_2`、`_3`、... 后缀直到唯一
+
+**② 在线列表请求协议 `LIST`**
+
+```
+客户端 → 服务器:  LIST\n
+
+服务器 → 当前用户:  Users: Alice Bob Charlie\n
+```
+
+- 无参数，精确匹配字符串 `LIST`
+- 返回当前所有已注册用户的用户名，空格分隔
+
+**③ 私聊协议 `PVT <target> <content>`**
+
+```
+客户端 → 服务器:  PVT Bob 你好！\n
+
+服务器处理逻辑：
+  1. 用空格分割出命令 "PVT" 和目标用户名 "Bob"
+  2. 剩余部分作为消息内容 "你好！"
+  3. 查找目标用户的 bufferevent
+
+服务器 → 目标用户:  [PVT] Alice: 你好！\n
+  或（用户不在线）
+服务器 → 当前用户:  [System] Bob is not online\n
+```
+
+- `PVT` 和目标用户名之间用**单个空格**分隔
+- 目标用户名和消息内容之间用**单个空格**分隔
+- 消息内容可以包含任意字符（包括空格），但不能包含换行符
+
+**④ 广播协议（默认）**
+
+```
+客户端 → 服务器:  大家好\n
+
+服务器处理逻辑：
+  1. 检查消息不匹配任何特殊命令
+  2. 遍历所有在线用户，跳过发送者自身
+
+服务器 → 其他所有用户:  Alice: 大家好\n
+```
+
+- 当消息不以 `Hello `、`LIST`、`PVT ` 开头时，视为广播消息
+- 服务器自动在消息前添加 `<发送者用户名>: ` 前缀
+
+#### 2.3.5 协议交互时序图
+
+```
+  Client A                    Server                    Client B
+    │                          │                          │
+    │──── Hello Alice ────────→│                          │
+    │                          │                          │
+    │←── [System] you have ───│                          │
+    │    logged in as Alice    │                          │
+    │←── Users: Alice ────────│                          │
+    │                          │── [System] Alice has ──→│
+    │                          │   logged in              │
+    │                          │                          │
+    │                          │←──── Hello Bob ─────────│
+    │                          │                          │
+    │←── [System] Bob has ────│←── [System] you have ───│
+    │    logged in             │   logged in as Bob       │
+    │                          │←── Users: Alice Bob ────│
+    │                          │                          │
+    │──── PVT Bob 你好 ──────→│                          │
+    │                          │── [PVT] Alice: 你好 ───→│
+    │                          │                          │
+    │                          │←──────── Hi! ───────────│
+    │←── Bob: Hi! ────────────│                          │
+    │                          │                          │
+    │──── LIST ───────────────→│                          │
+    │←── Users: Alice Bob ────│                          │
+    │                          │                          │
+    │==== (TCP 断开) ═════════│                          │
+    │                          │── [System] Alice has ──→│
+    │                          │   logged out             │
+```
+
+#### 2.3.6 客户端实现要点
+
+```cpp
+// 发送消息时，客户端必须在消息末尾追加 '\n'
+message += "\n";
+send(client_socket, message.c_str(), message.length(), 0);
+
+// 接收消息时，客户端按 '\n' 分割接收到的字节流
+// 支持 TCP 粘包：一条 recv() 可能包含多条消息
+while ((pos = recv_buffer.find('\n')) != std::string::npos) {
+    std::string message = recv_buffer.substr(0, pos);
+    // 处理完整消息行
+    recv_buffer.erase(0, pos + 1);
+}
+```
 
 ---
 
@@ -253,32 +412,48 @@ void event_cb(struct bufferevent* bev, short events, void* context){
 
 ---
 
-## 5. 本次修改详解
+## 5. 从单线程版到线程池版的修改详解
 
-### 5.1 CMakeLists.txt
+### 5.1 项目文件结构
 
-```diff
-- target_link_libraries(server PRIVATE ${LIBEVENT_LIBRARIES})
-+ target_link_libraries(server PRIVATE ${LIBEVENT_LIBRARIES} Threads::Threads)
+```
+Chatroom-with-libevent/
+├── server.cpp                  # 单线程版服务器（原版，未修改）
+├── server_withThreadPool.cpp   # 线程池版服务器（基于原版改造）
+├── client.cpp                  # 客户端
+├── Thread_pool.hpp             # 线程池实现（header-only）
+├── CMakeLists.txt              # 构建配置（同时构建两个服务器）
+└── TECHNICAL_DOC.md            # 本文档
 ```
 
-**原因**：线程池使用了 `std::thread`、`std::mutex` 等 POSIX 线程原语，需要链接 `pthread` 库。
+### 5.2 CMakeLists.txt 修改
+
+```cmake
+# 单线程版：仅链接 libevent
+target_link_libraries(server PRIVATE ${LIBEVENT_LIBRARIES})
+
+# 线程池版：链接 libevent + pthreads（线程池需要 std::thread）
+target_link_libraries(server_withThreadPool PRIVATE ${LIBEVENT_LIBRARIES} Threads::Threads)
+```
+
+**原因**：线程池使用了 `std::thread`、`std::mutex` 等 POSIX 线程原语，需要链接 `pthread` 库。单线程版 `server.cpp` 保持不变，不需要额外链接。
 
 ---
 
-### 5.2 server.cpp 修改汇总
+### 5.3 server_withThreadPool.cpp 相对于 server.cpp 的修改
 
-| 修改项 | 修改前 | 修改后 | 原因 |
-|--------|--------|--------|------|
-| 头文件 | 无 | `<event2/thread.h>`, `"Thread_pool.hpp"` | 启用 libevent 线程支持 + 引入线程池 |
-| `serverCtx` | 无同步机制 | 添加 `std::mutex mtx`, `ThreadPool pool{4}` | 保护共享状态 + 线程池实例 |
+| 修改项 | server.cpp（原版） | server_withThreadPool.cpp（线程池版） | 原因 |
+|--------|-------------------|--------------------------------------|------|
+| 头文件 | 无 | 新增 `<event2/thread.h>`, `"Thread_pool.hpp"` | 启用 libevent 线程支持 + 引入线程池 |
+| `serverCtx` | 无同步机制 | 新增 `std::mutex mtx`, `ThreadPool pool{4}` | 保护共享状态 + 线程池实例 |
 | `main()` | 直接创建 event_base | 先调用 `evthread_use_pthreads()` | 让 libevent 使用 pthreads，启用内部线程安全 |
 | `accept_cb` | `BEV_OPT_CLOSE_ON_FREE` | 添加 `BEV_OPT_THREADSAFE` 标志 | 允许跨线程安全访问 bufferevent |
+| `accept_cb` | 直接 push_back | 加 `std::lock_guard` 保护 userlist 写入 | 多线程安全 |
 | `read_cb` | 内联处理所有业务逻辑 | 仅提取消息行，投递到线程池 | I/O 与业务逻辑分离，避免阻塞事件循环 |
 | 新增 `process_message` | 无 | 从 read_cb 提取的业务逻辑 | 线程池工作线程执行的独立函数 |
-| 所有共享状态访问 | 无保护 | 加 `std::lock_guard<std::mutex>` | 多线程并发访问需要同步 |
+| `event_cb` | 无锁保护 | 加 `std::lock_guard<std::mutex>` | 退出回调也需要线程安全保护 |
 
-### 5.3 线程池工作流程
+### 5.4 线程池工作流程
 
 ```
 1. 客户端发送消息
@@ -310,8 +485,11 @@ mkdir build && cd build
 cmake ..
 make
 
-# 运行服务器（默认监听 0.0.0.0:8080）
+# 运行单线程服务器（默认监听 0.0.0.0:8080）
 ./server
+
+# 运行线程池版服务器
+./server_withThreadPool
 
 # 运行客户端
 ./client
@@ -319,8 +497,12 @@ make
 
 **输出示例**：
 ```
-[System] Server started (thread pool: 4 workers)
+# 单线程版
+[System] Server started
 [System] New connection
+
+# 线程池版
+[System] Server started (thread pool: 4 workers)
 [System] New connection
 ```
 
