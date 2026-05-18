@@ -33,35 +33,35 @@
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│                     主线程（事件循环）                        │
+│                     主线程（事件循环）                         │
 │  ┌─────────────┐  ┌─────────────┐  ┌─────────────────────┐  │
-│  │ 接受连接    │  │ 读取数据    │  │ 处理连接关闭        │  │
+│  │ 接受连接     │   │ 读取数据    │   │ 处理连接关闭          │  │
 │  │ accept_cb   │  │ read_cb     │  │ event_cb            │  │
 │  └──────┬──────┘  └──────┬──────┘  └─────────────────────┘  │
-│         │                │                                   │
+│         │                │                                  │
 │         │         ┌──────▼──────┐                           │
-│         │         │ 提取消息行  │                           │
+│         │         │ 提取消息行    │                           │
 │         │         │ (buffer→str)│                           │
 │         │         └──────┬──────┘                           │
-│         │                │                                   │
+│         │                │                                  │
 │         │         ┌──────▼──────────────────────┐           │
-│         │         │ pool.enqueue(process_message)│           │
-│         │         └──────────────────────────────┘           │
+│         │         │ pool.enqueue(process_message)│          │
+│         │         └──────────────────────────────┘          │
 └─────────┼───────────────────────────────────────────────────┘
           │
           ▼
 ┌─────────────────────────────────────────────────────────────┐
-│                   线程池（4 个工作线程）                      │
+│                   线程池（4 个工作线程）                       │
 │  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐       │
 │  │ Worker 1     │  │ Worker 2     │  │ Worker 3     │       │
 │  │ process_msg  │  │ process_msg  │  │ process_msg  │       │
 │  └──────┬───────┘  └──────┬───────┘  └──────┬───────┘       │
-│         │                 │                  │               │
+│         │                 │                 │               │
 │  ┌──────▼─────────────────▼──────────────────▼───────┐      │
-│  │              共享状态（需要 mutex 保护）            │      │
-│  │  • userlist        在线用户 bufferevent 列表       │      │
-│  │  • name_to_buffer  用户名 → bufferevent 映射       │      │
-│  │  • buffer_to_name  bufferevent → 用户名映射        │      │
+│  │              共享状态（需要 mutex 保护）             │      │
+│  │  • userlist        在线用户 bufferevent 列表        │      │
+│  │  • name_to_buffer  用户名 → bufferevent 映射        │      │
+│  │  • buffer_to_name  bufferevent → 用户名映射         │      │
 │  └───────────────────────────────────────────────────┘      │
 └─────────────────────────────────────────────────────────────┘
 ```
@@ -85,15 +85,15 @@
 
 ```
 ┌──────────────────────────────────────────────────────────────┐
-│  传输格式：ASCII 文本 + LF (\n) 行分隔                        │
+│  传输格式：ASCII 文本 + LF (\n) 行分隔                          │
 │                                                              │
-│  物理帧示例（TCP 字节流）：                                    │
-│  [48 65 6C 6C 6F 20 41 6C 69 63 65 0A]                      │
+│  物理帧示例（TCP 字节流）：                                      │
+│  [48 65 6C 6C 6F 20 41 6C 69 63 65 0A]                       │
 │  [48 65 6C 6C 6F 20 42 6F 62 0A]                             │
 │   ├─ "Hello Alice\n" ─┘ ├─ "Hello Bob\n" ─┘                  │
 │                                                              │
-│  提取方式：evbuffer_readln(input, &len, EVBUFFER_EOL_LF)     │
-│  libevent 自动从 TCP 字节流中按 '\n' 切割出完整消息行          │
+│  提取方式：evbuffer_readln(input, &len, EVBUFFER_EOL_LF)       │
+│  libevent 自动从 TCP 字节流中按 '\n' 切割出完整消息行             │
 └──────────────────────────────────────────────────────────────┘
 ```
 
@@ -641,3 +641,483 @@ Users: Alice
 - **并发处理**：多个客户端消息可以被线程池并行处理
 - **资源可控**：线程池大小固定为 4，避免了过多线程导致的上下文切换开销
 - **扩展性强**：后续可以轻松将数据库查询、消息持久化等 CPU 密集任务放入线程池
+
+---
+
+---
+
+# 附录：libevent 面试知识指南
+
+> 以下内容基于本项目源码，系统梳理 libevent 核心知识点，用于面试准备。
+
+---
+
+## A1. libevent 核心哲学：为什么用它？
+
+**libevent** 不仅仅是一个网络库，它是一个**事件通知引擎**。
+
+### 核心优势（面试加分点）
+1.  **跨平台抽象**：一套代码适配 Linux (epoll), macOS (kqueue), Windows (select/IOCP)。
+2.  **高性能**：底层自动选择最优的多路复用机制，支持 Edge Trigger (ET) 模式。
+3.  **统一事件源**：不仅能处理 Socket，还能处理**定时器 (Timer)**、**信号 (Signal)** 甚至 **stdin**。
+4.  **高级 I/O 抽象**：`bufferevent` 提供了开箱即用的异步读写和缓冲区管理。
+
+### 与裸写 epoll 的对比
+
+| 特性 | 裸写 epoll/select | libevent |
+| :--- | :--- | :--- |
+| **I/O 多路复用** | 需要手动封装，平台相关 | 统一封装，自动选择后端 |
+| **缓冲区管理** | 需要自己管理 `char[]` 和边界 | `evbuffer` 自动扩容，支持链式存储 |
+| **协议解析** | 需要手写状态机处理粘包 | `evbuffer_readln` 开箱即用 |
+| **定时器** | 需要维护最小堆或红黑树 | `event_new` + `EV_TIMEOUT` 轻松搞定 |
+
+---
+
+## A2. 核心架构：Reactor 模型详解
+
+libevent 严格遵循 **Reactor 设计模式**：
+
+```
+┌──────────────────────────────────────────────────┐
+│           Event Loop (event_base_dispatch)       │
+│                                                  │
+│  ┌───────────┐    ┌───────────┐    ┌───────────┐ │
+│  │ Event 1   │    │ Event 2   │    │ Event 3   │ │
+│  │ (Listener)│    │ (Client)  │    │ (Timer)   │ │
+│  └─────┬─────┘    └─────┬─────┘    └─────┬─────┘ │
+│        │                │                │       │
+│   accept_cb()      read_cb()        timeout_cb() │
+│        │                │                │       │
+│        └────────────────┼────────────────┘       │
+│                         ▼                        │
+│               Handle Business Logic              │
+└──────────────────────────────────────────────────┘
+```
+
+**面试关键词**：
+- **同步非阻塞 I/O**：虽然调用是同步的，但 I/O 操作本身是非阻塞的。
+- **I/O 多路复用**：一个线程监控多个 fd。
+- **回调驱动 (Callback)**：事件就绪时调用注册的函数。
+
+---
+
+## A3. event_base — 事件循环的心脏
+
+`event_base` 是 libevent 的核心对象，所有的事件都必须注册到它上面。
+
+### 关键 API
+
+```cpp
+struct event_base *base = event_base_new();       // 创建
+event_base_dispatch(base);                         // 启动（阻塞）
+event_base_loopexit(base, NULL);                   // 优雅退出
+event_base_loopbreak(base);                        // 强制退出
+event_base_free(base);                             // 释放
+```
+
+### 项目中的使用
+```cpp
+// server.cpp 第 185-211 行
+ctx.base = event_base_new();
+// ...
+event_base_dispatch(ctx.base); // 阻塞在此处，直到服务器关闭
+```
+
+---
+
+## A4. evconnlistener — 高性能监听器
+
+`evconnlistener` 封装了 Socket 的创建、绑定、监听和 Accept 过程，并且与事件循环无缝集成。
+
+### 项目中的使用
+```cpp
+// server.cpp 第 197-205 行
+struct evconnlistener* listener = evconnlistener_new_bind(
+    ctx.base,            // 绑定到事件循环
+    accept_cb,           // 新连接回调
+    &ctx,                // 传递给回调的上下文
+    LEV_OPT_CLOSE_ON_FREE | LEV_OPT_REUSEABLE, // 关键选项
+    -1,                  // backlog, -1 为默认
+    (struct sockaddr*)&sin,
+    sizeof(sin)
+);
+```
+
+### LEV_OPT 标志位
+
+| 标志 | 含义 |
+|------|------|
+| `LEV_OPT_CLOSE_ON_FREE` | 释放 listener 时自动关闭 socket fd |
+| `LEV_OPT_REUSEABLE` | 设置 `SO_REUSEADDR`，允许快速重启时复用端口 |
+| `LEV_OPT_LEAVE_SOCKETS_BLOCKING` | 保持 socket 为阻塞模式（默认非阻塞） |
+| `LEV_OPT_DEFERRED_ACCEPT` | 延迟 accept（Linux 下可优化性能） |
+
+---
+
+## A5. bufferevent — 带缓冲的事件 I/O 核心
+
+这是 libevent 最高级也最常用的组件。它把 **fd**、**输入缓冲区**、**输出缓冲区** 和 **回调函数** 绑定在一起。
+
+### 核心原理
+
+```
+┌─────────────────────────────────────┐
+│           bufferevent               │
+│                                     │
+│  fd (socket)                        │
+│  ┌────────────┐  ┌────────────┐    │
+│  │ input 缓冲区│  │output 缓冲区│    │
+│  │  (evbuffer) │  │  (evbuffer) │    │
+│  └──────┬─────┘  └──────┬─────┘    │
+│         │               │           │
+│    read_cb         write_cb         │
+│         │               │           │
+│    event_cb ←────────────┘          │
+│  (连接/错误事件)                      │
+└─────────────────────────────────────┘
+```
+
+- **读数据时**：数据从 fd → input 缓冲区，然后触发 `read_cb`
+- **写数据时**：往 output 缓冲区写数据，libevent 自动发送到 fd，发完触发 `write_cb`
+- **事件发生时**：连接成功、EOF、错误等触发 `event_cb`
+
+### 关键 API
+
+```cpp
+// 创建 bufferevent
+struct bufferevent* bufferevent_socket_new(base, fd, options);
+
+// 设置三个回调
+void bufferevent_setcb(bev, readcb, writecb, eventcb, cbarg);
+
+// 启用/禁用事件
+int bufferevent_enable(bev, EV_READ | EV_WRITE);
+
+// 获取缓冲区
+struct evbuffer* bufferevent_get_input(bev);
+struct evbuffer* bufferevent_get_output(bev);
+
+// 非阻塞连接（客户端使用）
+int bufferevent_socket_connect(bev, (struct sockaddr*)&sin, sizeof(sin));
+
+// 释放
+void bufferevent_free(bev);
+```
+
+### BEV_OPT 选项标志
+
+| 标志 | 含义 |
+|------|------|
+| `BEV_OPT_CLOSE_ON_FREE` | 调用 `bufferevent_free()` 时自动 close(fd) |
+| `BEV_OPT_THREADSAFE` | 为 bufferevent 加锁，允许跨线程安全访问 |
+| `BEV_OPT_DEFER_CALLBACKS` | 延迟回调执行，避免栈溢出 |
+| `BEV_OPT_UNLOCK_CALLBACKS` | 回调执行时不持锁（配合 DEFER_CALLBACKS 使用） |
+
+### 项目中的使用 — 服务端 accept_cb
+
+```cpp
+// server.cpp 第174行 — 创建 bufferevent
+struct bufferevent* bev = bufferevent_socket_new(base, fd, BEV_OPT_CLOSE_ON_FREE);
+// server.cpp 第176行 — 设置三个回调
+bufferevent_setcb(bev, read_cb, nullptr, event_cb, ctx);
+// server.cpp 第177行 — 启用读写事件
+bufferevent_enable(bev, EV_READ | EV_WRITE);
+```
+
+### 项目中的使用 — 客户端主动连接
+
+```cpp
+// client_libevent.cpp 第103行 — fd 传 -1，让 libevent 自动创建 socket
+g_ctx.bev = bufferevent_socket_new(g_ctx.base, -1, BEV_OPT_CLOSE_ON_FREE);
+// client_libevent.cpp 第123-124行 — 发起非阻塞连接
+bufferevent_socket_connect(g_ctx.bev, (struct sockaddr*)&sin, sizeof(sin));
+// 连接成功后会触发 event_cb 中的 BEV_EVENT_CONNECTED
+```
+
+---
+
+## A6. evbuffer — 解决 TCP 粘包的利器
+
+### 关键 API：evbuffer_readln
+
+```cpp
+char* line;
+size_t len;
+while ((line = evbuffer_readln(input, &len, EVBUFFER_EOL_LF)) != nullptr) {
+    std::string msg(line, len);
+    free(line); // 必须手动 free，因为底层是 malloc
+}
+```
+
+`EVBUFFER_EOL_LF` — 以 `\n` 分行 | `EVBUFFER_EOL_CRLF` — 以 `\r\n` 分行
+
+### 项目中的 send_line 实现
+
+```cpp
+// server.cpp 第24-28行
+static inline void send_line(struct bufferevent* bev, const std::string& msg){
+    struct evbuffer* output = bufferevent_get_output(bev);
+    evbuffer_add(output, msg.c_str(), msg.length());  // 追加消息内容
+    evbuffer_add(output, "\n", 1);                     // 追加换行符作为分隔
+}
+```
+
+注意：`evbuffer_add` 只是往 output 缓冲区写数据，**不会立即发送**。libevent 会在 fd 可写时自动将缓冲区数据发出。
+
+---
+
+## A7. 事件标志位详解
+
+### 通用事件标志
+
+| 标志 | 含义 | 使用场景 |
+|------|------|---------|
+| `EV_READ` | fd 可读时触发 | 监听 socket 数据到达 |
+| `EV_WRITE` | fd 可写时触发 | 发送缓冲区有空间 |
+| `EV_SIGNAL` | 信号事件 | 处理 SIGINT 等 |
+| `EV_TIMEOUT` | 超时事件 | 定时器 |
+| `EV_PERSIST` | 持续监听 | 不加此标志则触发一次后自动移除 |
+| `EV_ET` | 边沿触发（Edge Triggered） | 高性能场景，默认是水平触发（LT） |
+
+### bufferevent 事件标志（event_cb 的 events 参数）
+
+| 标志 | 含义 |
+|------|------|
+| `BEV_EVENT_CONNECTED` | 连接建立成功（客户端） |
+| `BEV_EVENT_EOF` | 对端关闭连接 |
+| `BEV_EVENT_ERROR` | 发生错误 |
+| `BEV_EVENT_TIMEOUT` | 读/写超时 |
+
+---
+
+## A8. 单线程 Reactor 架构 (server.cpp)
+
+### 整体流程
+
+```
+main()
+  ├── event_base_new()              创建事件循环
+  ├── evconnlistener_new_bind()     创建监听器，注册 accept_cb
+  └── event_base_dispatch()         启动事件循环
+        ├── [新连接] → accept_cb()  → 创建 bev → 设置回调
+        ├── [数据到达] → read_cb()  → evbuffer_readln → 分发处理
+        └── [断连/错误] → event_cb() → 清理资源
+```
+
+**上下文传递模式**：libevent 是 C 库，回调签名是固定函数指针，通过 `void* context` 传递 `serverCtx*`，回调中 `static_cast` 取回。
+
+### 单线程模型优缺点
+
+**优点**：无锁、无竞态、代码简单
+**缺点**：回调阻塞会卡住整个事件循环、无法利用多核 CPU
+
+---
+
+## A9. 多线程 Reactor 模型 (server_withThreadPool.cpp)
+
+### 关键改动
+
+| 改动点 | server.cpp | server_withThreadPool.cpp |
+|-------|------------|--------------------------|
+| evthread | 未调用 | `evthread_use_pthreads()` |
+| BEV_OPT | `BEV_OPT_CLOSE_ON_FREE` | `BEV_OPT_CLOSE_ON_FREE \| BEV_OPT_THREADSAFE` |
+| 业务逻辑 | 在 read_cb 中直接处理 | 提取行后交给线程池 |
+| 共享数据保护 | 无锁（单线程安全） | `std::mutex mtx` |
+
+### 多线程 libevent 三大关键
+
+**1. `evthread_use_pthreads()`** — 必须在 `event_base_new()` 之前调用
+
+**2. `BEV_OPT_THREADSAFE`** — bufferevent 内部加锁，线程池 worker 可安全写入 output 缓冲区
+
+**3. `std::mutex`** — 保护业务数据（userlist、name_to_buffer 等）
+
+### 线程安全层次
+
+```
+libevent 内部线程安全         ← evthread_use_pthreads() 提供
+bufferevent 线程安全          ← BEV_OPT_THREADSAFE 提供
+业务数据结构线程安全           ← 需要自己加锁（std::mutex）
+```
+
+---
+
+## A10. libevent vs 原生 socket 对比
+
+本项目同时提供了 `client.cpp`（原生 socket + 多线程）和 `client_libevent.cpp`（libevent 事件驱动）两种客户端实现。
+
+| 对比项 | 原生 socket (`client.cpp`) | libevent (`client_libevent.cpp`) |
+| :--- | :--- | :--- |
+| **线程模型** | 2个线程 (Main + Recv) | 1个线程 (Event Loop) |
+| **IO 模型** | 阻塞 I/O + 超时轮询 | 事件驱动 + 非阻塞 I/O |
+| **粘包处理** | 手动 `find('\n')` + 缓冲区拼接 | `evbuffer_readln()` 自动处理 |
+| **优雅退出** | `shutdown()` + `close(STDIN_FILENO)` | `event_base_loopexit()` |
+| **stdin 处理** | 独立线程阻塞读取 | `event_new(STDIN_FILENO)` 统一事件源 |
+
+---
+
+## A11. 内存管理与资源释放
+
+| 创建函数 | 释放函数 | 注意事项 |
+|---------|---------|---------|
+| `event_base_new()` | `event_base_free()` | 最后释放 |
+| `evconnlistener_new_bind()` | `evconnlistener_free()` | LEV_OPT_CLOSE_ON_FREE 自动关 fd |
+| `bufferevent_socket_new()` | `bufferevent_free()` | BEV_OPT_CLOSE_ON_FREE 自动关 fd |
+| `event_new()` | `event_free()` | — |
+| `evbuffer_readln()` 返回的 `char*` | `free()` | **不是 `delete`，不是 `evbuffer_free`** |
+
+### 释放顺序
+
+```cpp
+// 先释放子对象，最后释放 event_base
+event_free(stdin_event);
+bufferevent_free(bev);
+event_base_free(base);
+```
+
+### 陷阱
+
+- `bufferevent_free()` 不会等待 output 缓冲区发完——未发数据会丢失
+- `evbuffer_readln` 返回 `malloc` 分配的指针，必须 `free()`
+- 不设 `BEV_OPT_CLOSE_ON_FREE` 会导致 fd 泄漏
+
+---
+
+## A12. 常见面试问题与参考答案
+
+### Q1: 介绍一下你这个项目的服务端架构？
+
+**A**: 我使用 libevent 构建了一个 Reactor 模式的聊天室服务器。主线程运行 `event_base_dispatch` 事件循环，负责 I/O 事件的监听。对于每个新连接，我创建一个 `bufferevent` 来管理读写，并利用 `evbuffer_readln` 实现行协议的解析，解决了 TCP 粘包问题。为了提高并发能力，我还实现了一个多线程版本，将业务逻辑（如广播消息）封装成任务提交给线程池处理，并使用了 `BEV_OPT_THREADSAFE` 保证 bufferevent 的线程安全。
+
+### Q2: libevent 是怎么处理 TCP 粘包问题的？
+
+**A**: libevent 提供了 `evbuffer` 缓冲区机制。我在 `read_cb` 中使用 `evbuffer_readln` 函数。这个函数会从缓冲区寻找换行符 `\n`。如果找到，就返回一行数据；如果没找到（即包不完整），它会返回 NULL，数据保留在缓冲区等待下一次 `read_cb` 触发。这样就能自动、优雅地处理拆包和粘包。
+
+### Q3: 你的多线程版本是怎么保证线程安全的？
+
+**A**: 我采用了三层安全保障：
+1.  **底层支持**：调用 `evthread_use_pthreads()` 开启 libevent 的 pthread 支持。
+2.  **对象级别**：创建 bufferevent 时指定 `BEV_OPT_THREADSAFE`，保证多个线程可以同时读写同一个连接的缓冲区。
+3.  **业务级别**：对于在线用户列表等共享业务数据，我使用了 `std::mutex` 互斥锁进行保护。
+
+### Q4: 为什么选择 libevent 而不是 Boost.Asio？
+
+**A**: libevent 是纯 C 语言实现，性能极高且更加轻量级，非常适合这种对性能敏感的网络服务场景。同时它的 API 风格更接近操作系统底层，能让我更深入地理解网络编程的原理（如 Reactor 模式）。Boost.Asio 虽然 C++ 风格更好，但相对更重，且学习曲线较陡峭。
+
+### Q5: bufferevent 和直接用 event 有什么区别？
+
+**A**：
+- `event` 是底层抽象，只通知 fd 可读/可写，需要自己调用 `read()/write()`
+- `bufferevent` 是高层抽象，内置了读写两个 evbuffer 缓冲区，自动管理 I/O
+- bufferevent 提供了行解析（evbuffer_readln）、自动写入发送等功能
+- 本项目用 bufferevent 管理每个客户端连接，用 evbuffer_readln 解析行协议
+
+### Q6: 为什么要用 `void* context` 传递上下文？
+
+**A**: libevent 是 C 库，回调函数签名是固定的 C 函数指针，无法像 C++ 那样用 lambda 捕获变量。所以通过 `void*` 参数传递用户自定义的上下文数据。本项目定义了 `serverCtx` 结构体存储所有共享状态，在创建 listener/bev 时传入，回调中通过 `static_cast` 取回。
+
+### Q7: 如何优雅地退出 libevent 事件循环？
+
+**A**：
+- `event_base_loopexit(base, nullptr)` — 当前一轮回调处理完后退出
+- `event_base_loopbreak(base)` — 立即跳出
+- 客户端中先 `event_base_loopexit()`，然后在 main 中按序释放资源
+
+### Q8: evbuffer_add 是立即发送吗？
+
+**A**: 不是。`evbuffer_add` 只是往 output 缓冲区追加数据。libevent 会在 fd 可写时自动将缓冲区数据通过 `write()/send()` 发出。这是 bufferevent 的核心优势——写操作完全异步，开发者只需关注"写什么"，不需关注"什么时候写"。
+
+---
+
+## A13. 高级话题与深入理解
+
+### Reactor vs Proactor
+- **Reactor (libevent)**: 通知你"可读了"，你自己去 Read
+- **Proactor (IOCP)**: 帮你 Read 好了，通知你"来取数据吧"
+- libevent 是典型的 Reactor 模型
+
+### 水平触发 (LT) vs 边沿触发 (ET)
+- **LT**: 只要 fd 可读就持续通知，libevent 默认模式，安全但可能低效
+- **ET**: 只在状态变化时通知一次，高效但必须一次性读完
+- libevent 中通过 `EV_ET` 标志使用 ET 模式
+
+### write_cb 什么时候触发？
+当 output 缓冲区**从非空变为空**时触发，即所有待发送数据都发完了。本项目中 write_cb 设为 nullptr。
+
+### 为什么不把 accept_cb 也放到线程池？
+accept_cb 操作很轻量（创建 bev、设置回调、加入列表），而且需要操作 event_base。放在事件循环线程中更合理。只有**耗时的业务逻辑**才需要交给线程池。
+
+### 为什么 `bufferevent` 不直接 `write` 发送数据？
+直接调用 `write` 在非阻塞模式下可能返回 `EAGAIN`（缓冲区满），需要自己维护发送队列。`bufferevent` 帮你做了这件事：你只需要 `evbuffer_add`，libevent 底层自动处理发送时机和缓冲区管理。
+
+### libevent 底层 I/O 多路复用是怎么选择的？
+`event_base_new()` 时自动检测系统支持：
+- Linux: epoll > poll > select
+- macOS/BSD: kqueue > poll > select
+- Windows: select
+- 可通过 `event_base_get_method()` 查看实际使用的方法
+
+### 跨线程唤醒机制
+当线程池 worker 调用 `evbuffer_add()` 往 bev 的 output 缓冲区写数据后，libevent 内部会通过 `event_base_notify` 机制唤醒主线程的事件循环，让主线程尽快处理新数据的发送。
+
+---
+
+## A14. libevent API 速查表
+
+### 事件循环
+
+| API | 用途 |
+|-----|------|
+| `event_base_new()` | 创建事件循环 |
+| `event_base_dispatch()` | 启动事件循环（阻塞） |
+| `event_base_loopexit()` | 退出事件循环 |
+| `event_base_loopbreak()` | 立即跳出事件循环 |
+| `event_base_free()` | 释放事件循环 |
+
+### 监听器
+
+| API | 用途 |
+|-----|------|
+| `evconnlistener_new_bind()` | 创建 TCP 监听器 |
+| `evconnlistener_get_base()` | 获取关联的 event_base |
+| `evconnlistener_free()` | 释放监听器 |
+
+### Bufferevent
+
+| API | 用途 |
+|-----|------|
+| `bufferevent_socket_new()` | 创建 bufferevent |
+| `bufferevent_setcb()` | 设置读/写/事件回调 |
+| `bufferevent_enable()` | 启用事件 |
+| `bufferevent_get_input()` | 获取输入缓冲区 |
+| `bufferevent_get_output()` | 获取输出缓冲区 |
+| `bufferevent_socket_connect()` | 发起非阻塞连接 |
+| `bufferevent_free()` | 释放 bufferevent |
+
+### evbuffer
+
+| API | 用途 |
+|-----|------|
+| `evbuffer_add()` | 追加数据到缓冲区 |
+| `evbuffer_readln()` | 按行读取（解决粘包） |
+| `evbuffer_get_length()` | 获取缓冲区数据长度 |
+| `evbuffer_remove()` | 取出并消费数据 |
+
+### 原始事件
+
+| API | 用途 |
+|-----|------|
+| `event_new()` | 创建事件 |
+| `event_add()` | 添加到事件循环 |
+| `event_free()` | 释放事件 |
+
+### 线程
+
+| API | 用途 |
+|-----|------|
+| `evthread_use_pthreads()` | 启用 pthread 支持 |
+| `BEV_OPT_THREADSAFE` | bufferevent 线程安全标志 |
+
+---
+
+*文档基于 Chatroom-with-libevent 项目源码整理，适用于 libevent 2.x 版本面试准备。*
